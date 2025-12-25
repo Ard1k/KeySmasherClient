@@ -3,6 +3,7 @@
 #endif
 
 #include <windows.h>
+#include <shellapi.h>
 #include <winhttp.h>
 #include <string>
 #include <iostream>
@@ -23,6 +24,7 @@
 
 HHOOK keyboardHook;
 HWND lastForeground = nullptr;
+HWND g_hWnd = NULL;
 
 const std::wstring TARGET_TITLE = L"Parsec";
 const std::wstring WS_HOST = L"192.168.40.70";
@@ -40,12 +42,22 @@ std::mutex queueMutex;
 std::condition_variable queueCv;
 std::queue<std::string> msgQueue;
 std::atomic<bool> running{ true };
+std::atomic<bool> paused{ false };
 std::thread wsThread;
 
 // Title animator
 std::thread titleThread;
 std::mutex titleMutex;
 std::unordered_map<HWND, std::wstring> originalTitles;
+
+// Tray
+const UINT TRAY_ICON_ID = 1;
+const UINT WM_TRAY_CALLBACK = WM_APP + 1;
+const int IDM_SHOW_CONSOLE = 1001;
+const int IDM_TOGGLE_PAUSE = 1002;
+const int IDM_EXIT = 1003;
+
+bool consoleVisible = false;
 
 bool IsTargetWindowActive() {
     HWND hwnd = GetForegroundWindow();
@@ -165,7 +177,7 @@ void WSWorker() {
             }
         }
 
-        if (!msg.empty()) {
+        if (!msg.empty() && !paused.load()) {
             DWORD sendResult = WinHttpWebSocketSend(conn->hWebSocket,
                 WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
                 (BYTE*)msg.c_str(),
@@ -187,6 +199,11 @@ void TitleAnimator() {
     size_t idx = 0;
 
     while (running) {
+        if (paused.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+
         HWND hwnd = GetForegroundWindow();
         bool active = false;
         if (hwnd) {
@@ -241,9 +258,100 @@ void TitleAnimator() {
     }
 }
 
+void AddTrayIcon(HWND hwnd) {
+    NOTIFYICONDATA nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_ICON_ID;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAY_CALLBACK;
+    nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wcscpy_s(nid.szTip, L"KeySmasherClient");
+    Shell_NotifyIcon(NIM_ADD, &nid);
+}
+
+void RemoveTrayIcon(HWND hwnd) {
+    NOTIFYICONDATA nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_ICON_ID;
+    Shell_NotifyIcon(NIM_DELETE, &nid);
+}
+
+void ShowTrayMenu(HWND hwnd) {
+    POINT pt;
+    GetCursorPos(&pt);
+
+    HMENU hMenu = CreatePopupMenu();
+    std::wstring showLabel = consoleVisible ? L"Hide Console" : L"Show Console";
+    AppendMenu(hMenu, MF_STRING, IDM_SHOW_CONSOLE, showLabel.c_str());
+    std::wstring pauseLabel = paused.load() ? L"Unpause" : L"Pause";
+    AppendMenu(hMenu, MF_STRING, IDM_TOGGLE_PAUSE, pauseLabel.c_str());
+    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hMenu, MF_STRING, IDM_EXIT, L"Exit");
+
+    // Use TPM_RETURNCMD so TrackPopupMenu returns the selected command instead of sending messages
+    int cmd = TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(hMenu);
+
+    if (cmd != 0) {
+        // Post WM_COMMAND to be handled in the window procedure
+        PostMessage(hwnd, WM_COMMAND, MAKEWPARAM(cmd, 0), 0);
+    }
+}
+
+LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_TRAY_CALLBACK:
+        if (lParam == WM_RBUTTONUP) {
+            ShowTrayMenu(hwnd);
+        } else if (lParam == WM_LBUTTONDBLCLK) {
+            // toggle console on double-click
+            if (consoleVisible) {
+                ShowWindow(GetConsoleWindow(), SW_HIDE);
+                consoleVisible = false;
+            } else {
+                ShowWindow(GetConsoleWindow(), SW_SHOW);
+                consoleVisible = true;
+            }
+        }
+        break;
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDM_SHOW_CONSOLE:
+            if (consoleVisible) {
+                ShowWindow(GetConsoleWindow(), SW_HIDE);
+                consoleVisible = false;
+            } else {
+                ShowWindow(GetConsoleWindow(), SW_SHOW);
+                consoleVisible = true;
+            }
+            break;
+        case IDM_TOGGLE_PAUSE:
+            paused = !paused.load();
+            break;
+        case IDM_EXIT:
+            // signal shutdown
+            running = false;
+            PostQuitMessage(0);
+            break;
+        }
+        break;
+    case WM_DESTROY:
+        RemoveTrayIcon(hwnd);
+        PostQuitMessage(0);
+        break;
+    default:
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         if (wParam == WM_KEYDOWN || wParam == WM_KEYUP || wParam == WM_SYSKEYDOWN || wParam == WM_SYSKEYUP) {
+            if (paused.load()) return CallNextHookEx(NULL, nCode, wParam, lParam);
+
             KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
 
             bool keyDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
@@ -257,7 +365,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     msgQueue.push(msg);
                 }
                 queueCv.notify_one();
-                std::cout << msg + "\n";
+                if (consoleVisible) std::cout << msg + "\n";
             }
         }
     }
@@ -266,6 +374,32 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 int main() {
+    // create hidden window to receive tray messages
+    HINSTANCE hInstance = GetModuleHandle(NULL);
+    WNDCLASSEX wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = TrayWndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = L"KeySmasherTrayClass";
+    RegisterClassEx(&wc);
+
+    g_hWnd = CreateWindowEx(0, wc.lpszClassName, L"KeySmasherTrayWindow", 0,
+        0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
+
+    if (!g_hWnd) {
+        std::cout << "Failed to create tray window\n";
+        return 1;
+    }
+
+    AddTrayIcon(g_hWnd);
+
+    // hide console by default
+    HWND console = GetConsoleWindow();
+    if (console) {
+        ShowWindow(console, SW_HIDE);
+        consoleVisible = false;
+    }
+
     // start websocket worker thread
     wsThread = std::thread(WSWorker);
 
@@ -276,16 +410,20 @@ int main() {
         running = false;
         queueCv.notify_all();
         if (wsThread.joinable()) wsThread.join();
+        RemoveTrayIcon(g_hWnd);
+        DestroyWindow(g_hWnd);
         return 1;
     }
 
     // start title animator
     titleThread = std::thread(TitleAnimator);
 
-    std::cout << "Listening for keys...\n";
-
+    // message loop for tray window and commands
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {}
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
 
     // signal thread to stop and clean up
     running = false;
@@ -294,5 +432,10 @@ int main() {
     if (titleThread.joinable()) titleThread.join();
 
     UnhookWindowsHookEx(keyboardHook);
+
+    RemoveTrayIcon(g_hWnd);
+    DestroyWindow(g_hWnd);
+    UnregisterClass(wc.lpszClassName, hInstance);
+
     return 0;
 }
