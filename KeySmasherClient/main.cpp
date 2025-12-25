@@ -31,6 +31,9 @@ HWND g_hWnd = NULL;
 HICON g_hIconRunning = NULL;
 HICON g_hIconPaused = NULL;
 
+// single-instance mutex
+HANDLE g_singletonMutex = NULL;
+
 const std::wstring TARGET_TITLE = L"Parsec";
 const std::wstring WS_HOST = L"192.168.40.70";
 const INTERNET_PORT WS_PORT = 80;
@@ -375,6 +378,19 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    // enforce single instance using a named mutex
+    g_singletonMutex = CreateMutexW(NULL, FALSE, L"Global\\KeySmasherClient_Mutex");
+    if (!g_singletonMutex) {
+        MessageBoxW(NULL, L"Failed to create instance mutex", L"KeySmasherClient", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxW(NULL, L"Another instance of KeySmasherClient is already running.", L"KeySmasherClient", MB_OK | MB_ICONINFORMATION);
+        CloseHandle(g_singletonMutex);
+        g_singletonMutex = NULL;
+        return 1;
+    }
+
     // create hidden window to receive tray messages
     // HINSTANCE hInstance = GetModuleHandle(NULL); // use provided hInstance
     WNDCLASSEX wc = {};
@@ -391,6 +407,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     if (!g_hWnd) {
         MessageBoxW(NULL, L"Failed to create tray window", L"KeySmasherClient", MB_OK | MB_ICONERROR);
+        if (g_singletonMutex) { CloseHandle(g_singletonMutex); g_singletonMutex = NULL; }
         return 1;
     }
 
@@ -419,6 +436,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (wsThread.joinable()) wsThread.join();
         RemoveTrayIcon(g_hWnd);
         DestroyWindow(g_hWnd);
+        if (g_singletonMutex) { CloseHandle(g_singletonMutex); g_singletonMutex = NULL; }
         return 1;
     }
 
@@ -445,6 +463,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (g_hIconPaused) DestroyIcon(g_hIconPaused);
     DestroyWindow(g_hWnd);
     UnregisterClass(wc.lpszClassName, hInstance);
+
+    if (g_singletonMutex) { CloseHandle(g_singletonMutex); g_singletonMutex = NULL; }
 
     return 0;
 }
