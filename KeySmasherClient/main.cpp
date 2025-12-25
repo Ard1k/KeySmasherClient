@@ -15,6 +15,8 @@
 #include <chrono>
 #include <unordered_map>
 
+#include "resource.h"
+
 #ifndef WINHTTP_WEB_SOCKET_SUCCESS_CLOSE
 #define WINHTTP_WEB_SOCKET_SUCCESS_CLOSE 1000
 #endif
@@ -25,6 +27,9 @@
 HHOOK keyboardHook;
 HWND lastForeground = nullptr;
 HWND g_hWnd = NULL;
+
+HICON g_hIconRunning = NULL;
+HICON g_hIconPaused = NULL;
 
 const std::wstring TARGET_TITLE = L"Parsec";
 const std::wstring WS_HOST = L"192.168.40.70";
@@ -56,6 +61,18 @@ const UINT WM_TRAY_CALLBACK = WM_APP + 1;
 // const int IDM_SHOW_CONSOLE = 1001; // removed - no console
 const int IDM_TOGGLE_PAUSE = 1002;
 const int IDM_EXIT = 1003;
+
+void UpdateTrayIcon(bool isPaused) {
+    if (!g_hWnd) return;
+    NOTIFYICONDATA nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = g_hWnd;
+    nid.uID = TRAY_ICON_ID;
+    nid.uFlags = NIF_ICON;
+    nid.hIcon = isPaused ? (g_hIconPaused ? g_hIconPaused : LoadIcon(NULL, IDI_APPLICATION))
+                         : (g_hIconRunning ? g_hIconRunning : LoadIcon(NULL, IDI_APPLICATION));
+    Shell_NotifyIcon(NIM_MODIFY, &nid);
+}
 
 bool IsTargetWindowActive() {
     HWND hwnd = GetForegroundWindow();
@@ -263,7 +280,7 @@ void AddTrayIcon(HWND hwnd) {
     nid.uID = TRAY_ICON_ID;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY_CALLBACK;
-    nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    nid.hIcon = g_hIconRunning ? g_hIconRunning : LoadIcon(NULL, IDI_APPLICATION);
     wcscpy_s(nid.szTip, L"KeySmasherClient");
     Shell_NotifyIcon(NIM_ADD, &nid);
 }
@@ -281,6 +298,7 @@ void ShowTrayMenu(HWND hwnd) {
     GetCursorPos(&pt);
 
     HMENU hMenu = CreatePopupMenu();
+    // no console menu when running as GUI
     std::wstring pauseLabel = paused.load() ? L"Unpause" : L"Pause";
     AppendMenu(hMenu, MF_STRING, IDM_TOGGLE_PAUSE, pauseLabel.c_str());
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
@@ -304,12 +322,14 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         } else if (lParam == WM_LBUTTONDBLCLK) {
             // toggle pause on double-click
             paused = !paused.load();
+            UpdateTrayIcon(paused.load());
         }
         break;
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IDM_TOGGLE_PAUSE:
             paused = !paused.load();
+            UpdateTrayIcon(paused.load());
             break;
         case IDM_EXIT:
             // signal shutdown
@@ -362,6 +382,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.lpfnWndProc = TrayWndProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = L"KeySmasherTrayClass";
+    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
     RegisterClassEx(&wc);
 
     g_hWnd = CreateWindowEx(0, wc.lpszClassName, L"KeySmasherTrayWindow", 0,
@@ -372,7 +394,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
+    // load icons from resources (resources\*.ico expected in project)
+    g_hIconRunning = (HICON)LoadImage(hInstance, MAKEINTRESOURCE(IDI_TRAY_RUNNING), IMAGE_ICON, 0, 0, LR_DEFAULTCOLOR);
+    g_hIconPaused = (HICON)LoadImage(hInstance, MAKEINTRESOURCE(IDI_TRAY_PAUSED), IMAGE_ICON, 0, 0, LR_DEFAULTCOLOR);
+
+    // set window icons
+    if (g_hIconRunning) {
+        SendMessage(g_hWnd, WM_SETICON, ICON_BIG, (LPARAM)g_hIconRunning);
+        SendMessage(g_hWnd, WM_SETICON, ICON_SMALL, (LPARAM)g_hIconRunning);
+    }
+
     AddTrayIcon(g_hWnd);
+    UpdateTrayIcon(paused.load());
 
     // start websocket worker thread
     wsThread = std::thread(WSWorker);
@@ -408,6 +441,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     UnhookWindowsHookEx(keyboardHook);
 
     RemoveTrayIcon(g_hWnd);
+    if (g_hIconRunning) DestroyIcon(g_hIconRunning);
+    if (g_hIconPaused) DestroyIcon(g_hIconPaused);
     DestroyWindow(g_hWnd);
     UnregisterClass(wc.lpszClassName, hInstance);
 

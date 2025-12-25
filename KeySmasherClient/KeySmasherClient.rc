@@ -1,0 +1,4 @@
+#include "resource.h" 
+IDI_APP ICON "resources\\app.ico" 
+IDI_TRAY_RUNNING ICON "resources\\tray_running.ico" 
+IDI_TRAY_PAUSED ICON "resources\\tray_paused.ico"
