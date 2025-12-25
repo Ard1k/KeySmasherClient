@@ -30,12 +30,13 @@ HWND g_hWnd = NULL;
 
 HICON g_hIconRunning = NULL;
 HICON g_hIconPaused = NULL;
+HICON g_hIconConnecting = NULL; // red icon while connecting
 
 // single-instance mutex
 HANDLE g_singletonMutex = NULL;
 
 const std::wstring TARGET_TITLE = L"Parsec";
-const std::wstring WS_HOST = L"192.168.40.70";
+const std::wstring WS_HOST = L"192.168.40.71";
 const INTERNET_PORT WS_PORT = 80;
 const std::wstring WS_PATH = L"/ws";
 
@@ -53,6 +54,11 @@ std::atomic<bool> running{ true };
 std::atomic<bool> paused{ false };
 std::thread wsThread;
 
+// connection state
+std::atomic<bool> wsConnected{ false };
+std::atomic<bool> wsConnecting{ false };
+std::atomic<bool> noConnectionAlertShown{ false };
+
 // Title animator
 std::thread titleThread;
 std::mutex titleMutex;
@@ -65,15 +71,26 @@ const UINT WM_TRAY_CALLBACK = WM_APP + 1;
 const int IDM_TOGGLE_PAUSE = 1002;
 const int IDM_EXIT = 1003;
 
-void UpdateTrayIcon(bool isPaused) {
+void UpdateTrayIcon() {
     if (!g_hWnd) return;
     NOTIFYICONDATA nid = {};
     nid.cbSize = sizeof(nid);
     nid.hWnd = g_hWnd;
     nid.uID = TRAY_ICON_ID;
     nid.uFlags = NIF_ICON;
-    nid.hIcon = isPaused ? (g_hIconPaused ? g_hIconPaused : LoadIcon(NULL, IDI_APPLICATION))
-                         : (g_hIconRunning ? g_hIconRunning : LoadIcon(NULL, IDI_APPLICATION));
+
+    // Priority: connecting (red) -> paused -> connected (running) -> default running
+    if (wsConnecting.load()) {
+        nid.hIcon = g_hIconConnecting ? g_hIconConnecting : LoadIcon(NULL, IDI_ERROR);
+    } else if (paused.load()) {
+        nid.hIcon = g_hIconPaused ? g_hIconPaused : LoadIcon(NULL, IDI_APPLICATION);
+    } else if (wsConnected.load()) {
+        nid.hIcon = g_hIconRunning ? g_hIconRunning : LoadIcon(NULL, IDI_APPLICATION);
+    } else {
+        // not connected and not currently trying -> show error icon
+        nid.hIcon = g_hIconConnecting ? g_hIconConnecting : LoadIcon(NULL, IDI_ERROR);
+    }
+
     Shell_NotifyIcon(NIM_MODIFY, &nid);
 }
 
@@ -91,7 +108,14 @@ bool IsTargetWindowActive() {
 }
 
 void CloseWSConnection(std::unique_ptr<WSConnection>& conn) {
-    if (!conn) return;
+    // mark disconnected and allow future alerts
+    wsConnected = false;
+    noConnectionAlertShown = false;
+
+    if (!conn) {
+        UpdateTrayIcon();
+        return;
+    }
     if (conn->hWebSocket) {
         WinHttpWebSocketClose(conn->hWebSocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE, NULL, 0);
         WinHttpCloseHandle(conn->hWebSocket);
@@ -106,6 +130,7 @@ void CloseWSConnection(std::unique_ptr<WSConnection>& conn) {
         conn->hSession = NULL;
     }
     conn.reset();
+    UpdateTrayIcon();
 }
 
 std::unique_ptr<WSConnection> ConnectWebSocket() {
@@ -117,14 +142,24 @@ std::unique_ptr<WSConnection> ConnectWebSocket() {
         WINHTTP_NO_PROXY_BYPASS, 0);
 
     if (!conn->hSession) {
+        wsConnected = false;
         return nullptr;
     }
+
+    // set reasonable timeouts so blocking calls return in a timely manner
+    // resolveTimeout, connectTimeout, sendTimeout, receiveTimeout in milliseconds
+    WinHttpSetTimeouts(conn->hSession, 3000, 3000, 3000, 3000);
+
+    if (!running.load()) { CloseWSConnection(conn); wsConnected = false; return nullptr; }
 
     conn->hConnect = WinHttpConnect(conn->hSession, WS_HOST.c_str(), WS_PORT, 0);
     if (!conn->hConnect) {
         CloseWSConnection(conn);
+        wsConnected = false;
         return nullptr;
     }
+
+    if (!running.load()) { CloseWSConnection(conn); wsConnected = false; return nullptr; }
 
     HINTERNET hRequest = WinHttpOpenRequest(
         conn->hConnect, L"GET", WS_PATH.c_str(),
@@ -134,8 +169,11 @@ std::unique_ptr<WSConnection> ConnectWebSocket() {
 
     if (!hRequest) {
         CloseWSConnection(conn);
+        wsConnected = false;
         return nullptr;
     }
+
+    if (!running.load()) { WinHttpCloseHandle(hRequest); CloseWSConnection(conn); wsConnected = false; return nullptr; }
 
     BOOL result = WinHttpSetOption(hRequest,
         WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET,
@@ -144,8 +182,11 @@ std::unique_ptr<WSConnection> ConnectWebSocket() {
     if (!result) {
         WinHttpCloseHandle(hRequest);
         CloseWSConnection(conn);
+        wsConnected = false;
         return nullptr;
     }
+
+    if (!running.load()) { WinHttpCloseHandle(hRequest); CloseWSConnection(conn); wsConnected = false; return nullptr; }
 
     result = WinHttpSendRequest(hRequest,
         WINHTTP_NO_ADDITIONAL_HEADERS, 0,
@@ -155,16 +196,26 @@ std::unique_ptr<WSConnection> ConnectWebSocket() {
     if (!result || !WinHttpReceiveResponse(hRequest, NULL)) {
         WinHttpCloseHandle(hRequest);
         CloseWSConnection(conn);
+        wsConnected = false;
         return nullptr;
     }
+
+    if (!running.load()) { WinHttpCloseHandle(hRequest); CloseWSConnection(conn); wsConnected = false; return nullptr; }
 
     conn->hWebSocket = WinHttpWebSocketCompleteUpgrade(hRequest, NULL);
     WinHttpCloseHandle(hRequest);
 
     if (!conn->hWebSocket) {
         CloseWSConnection(conn);
+        wsConnected = false;
         return nullptr;
     }
+
+    // mark connected
+    wsConnected = true;
+    noConnectionAlertShown = false;
+
+    UpdateTrayIcon();
 
     return conn;
 }
@@ -174,11 +225,28 @@ void WSWorker() {
 
     while (running) {
         if (!conn) {
+            // indicate connecting state and update tray
+            wsConnecting = true;
+            UpdateTrayIcon();
+
             conn = ConnectWebSocket();
+
+            // finished attempt
+            wsConnecting = false;
+            UpdateTrayIcon();
+
             if (!conn) {
-                // failed to connect, wait and retry
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-                continue;
+                // failed to connect - always show error
+                MessageBoxW(NULL, L"Couldn't establish WebSocket connection. Exiting application...", L"KeySmasherClient", MB_OK | MB_ICONERROR);
+
+                // request application to exit immediately
+                if (g_hWnd) {
+                    PostMessage(g_hWnd, WM_COMMAND, MAKEWPARAM(IDM_EXIT, 0), 0);
+                } else {
+                    // fallback: signal quit
+                    PostQuitMessage(0);
+                }
+                break; // break worker loop and exit thread
             }
         }
 
@@ -196,6 +264,14 @@ void WSWorker() {
         }
 
         if (!msg.empty() && !paused.load()) {
+            if (!conn || !conn->hWebSocket) {
+                // no active connection while trying to process a message -> notify user (only once until reconnect)
+                if (!noConnectionAlertShown.exchange(true)) {
+                    MessageBoxW(NULL, L"Nelze zpracovat zpravu: neni aktivni WebSocket spojeni.", L"KeySmasherClient - Chyba", MB_OK | MB_ICONERROR);
+                }
+                continue;
+            }
+
             DWORD sendResult = WinHttpWebSocketSend(conn->hWebSocket,
                 WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
                 (BYTE*)msg.c_str(),
@@ -325,14 +401,14 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         } else if (lParam == WM_LBUTTONDBLCLK) {
             // toggle pause on double-click
             paused = !paused.load();
-            UpdateTrayIcon(paused.load());
+            UpdateTrayIcon();
         }
         break;
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IDM_TOGGLE_PAUSE:
             paused = !paused.load();
-            UpdateTrayIcon(paused.load());
+            UpdateTrayIcon();
             break;
         case IDM_EXIT:
             // signal shutdown
@@ -414,6 +490,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // load icons from resources (resources\*.ico expected in project)
     g_hIconRunning = (HICON)LoadImage(hInstance, MAKEINTRESOURCE(IDI_TRAY_RUNNING), IMAGE_ICON, 0, 0, LR_DEFAULTCOLOR);
     g_hIconPaused = (HICON)LoadImage(hInstance, MAKEINTRESOURCE(IDI_TRAY_PAUSED), IMAGE_ICON, 0, 0, LR_DEFAULTCOLOR);
+    // use system error icon as red/connecting icon
+    g_hIconConnecting = LoadIcon(NULL, IDI_ERROR);
 
     // set window icons
     if (g_hIconRunning) {
@@ -422,9 +500,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     AddTrayIcon(g_hWnd);
-    UpdateTrayIcon(paused.load());
+    UpdateTrayIcon();
 
-    // start websocket worker thread
+    // start websocket worker thread (will try to connect immediately and set connecting icon)
     wsThread = std::thread(WSWorker);
 
     keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, NULL, 0);
@@ -461,6 +539,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     RemoveTrayIcon(g_hWnd);
     if (g_hIconRunning) DestroyIcon(g_hIconRunning);
     if (g_hIconPaused) DestroyIcon(g_hIconPaused);
+    if (g_hIconConnecting) DestroyIcon(g_hIconConnecting);
     DestroyWindow(g_hWnd);
     UnregisterClass(wc.lpszClassName, hInstance);
 
