@@ -14,6 +14,8 @@
 #include <memory>
 #include <chrono>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "resource.h"
 
@@ -36,7 +38,7 @@ HICON g_hIconConnecting = NULL; // red icon while connecting
 HANDLE g_singletonMutex = NULL;
 
 const std::wstring TARGET_TITLE = L"Parsec";
-const std::wstring WS_HOST = L"192.168.40.71";
+const std::wstring WS_HOST = L"192.168.40.70";
 const INTERNET_PORT WS_PORT = 80;
 const std::wstring WS_PATH = L"/ws";
 
@@ -58,6 +60,10 @@ std::thread wsThread;
 std::atomic<bool> wsConnected{ false };
 std::atomic<bool> wsConnecting{ false };
 std::atomic<bool> noConnectionAlertShown{ false };
+
+// state for pressed keys tracking
+std::mutex stateMutex;
+std::unordered_set<int> pressedKeys; // keys for which last sent prefix was 'd'
 
 // Title animator
 std::thread titleThread;
@@ -220,6 +226,24 @@ std::unique_ptr<WSConnection> ConnectWebSocket() {
     return conn;
 }
 
+void ReleaseAllPressedKeys() {
+    std::vector<std::string> outs;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        for (int vk : pressedKeys) {
+            std::string msg = std::string(1, 'u') + std::to_string(vk);
+            outs.push_back(msg);
+        }
+        pressedKeys.clear();
+    }
+
+    if (!outs.empty()) {
+        std::lock_guard<std::mutex> qlock(queueMutex);
+        for (auto &m : outs) msgQueue.push(m);
+        queueCv.notify_all();
+    }
+}
+
 void WSWorker() {
     std::unique_ptr<WSConnection> conn;
 
@@ -236,7 +260,7 @@ void WSWorker() {
             UpdateTrayIcon();
 
             if (!conn) {
-                // failed to connect - always show error
+                // failed to connect - always show error and exit
                 MessageBoxW(NULL, L"Couldn't establish WebSocket connection. Exiting application...", L"KeySmasherClient", MB_OK | MB_ICONERROR);
 
                 // request application to exit immediately
@@ -291,6 +315,7 @@ void WSWorker() {
 void TitleAnimator() {
     const wchar_t* indicators[] = {L"-", L"\\", L"|", L"/"};
     size_t idx = 0;
+    bool prevActive = false;
 
     while (running) {
         if (paused.load()) {
@@ -308,6 +333,12 @@ void TitleAnimator() {
                 active = true;
             }
         }
+
+        if (!active && prevActive) {
+            // Parsec lost focus -> release pressed keys
+            ReleaseAllPressedKeys();
+        }
+        prevActive = active;
 
         if (active) {
             // animate
@@ -401,6 +432,9 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         } else if (lParam == WM_LBUTTONDBLCLK) {
             // toggle pause on double-click
             paused = !paused.load();
+            if (paused.load()) {
+                ReleaseAllPressedKeys();
+            }
             UpdateTrayIcon();
         }
         break;
@@ -408,11 +442,15 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         switch (LOWORD(wParam)) {
         case IDM_TOGGLE_PAUSE:
             paused = !paused.load();
+            if (paused.load()) {
+                ReleaseAllPressedKeys();
+            }
             UpdateTrayIcon();
             break;
         case IDM_EXIT:
             // signal shutdown
             running = false;
+            queueCv.notify_all();
             PostQuitMessage(0);
             break;
         }
@@ -438,6 +476,14 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             bool keyUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
 
             if (IsTargetWindowActive()) {
+                // if no websocket connection, show an error (only once until reconnect)
+                if (!wsConnected.load()) {
+                    if (!noConnectionAlertShown.exchange(true)) {
+                        MessageBoxW(NULL, L"Nelze zpracovat zpravu: neni aktivni WebSocket spojeni.", L"KeySmasherClient - Chyba", MB_OK | MB_ICONERROR);
+                    }
+                    return CallNextHookEx(NULL, nCode, wParam, lParam);
+                }
+
                 char prefix = keyDown ? 'd' : 'u';
                 std::string msg = std::string(1, prefix) + std::to_string(kb->vkCode);
                 {
@@ -445,6 +491,13 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     msgQueue.push(msg);
                 }
                 queueCv.notify_one();
+
+                // update pressedKeys state
+                {
+                    std::lock_guard<std::mutex> slock(stateMutex);
+                    if (prefix == 'd') pressedKeys.insert((int)kb->vkCode);
+                    else pressedKeys.erase((int)kb->vkCode);
+                }
                 //std::cout << msg + "\n"; no console available to print
             }
         }
