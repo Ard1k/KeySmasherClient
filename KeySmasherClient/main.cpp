@@ -38,9 +38,46 @@ HICON g_hIconConnecting = NULL; // red icon while connecting
 HANDLE g_singletonMutex = NULL;
 
 const std::wstring TARGET_TITLE = L"Parsec";
-const std::wstring WS_HOST = L"192.168.40.70";
-const INTERNET_PORT WS_PORT = 80;
+
+// websocket endpoint (loaded from KeySmasherClient.ini next to the executable)
+std::wstring WS_HOST = L"0.0.0.0";
+INTERNET_PORT WS_PORT = 80;
 const std::wstring WS_PATH = L"/ws";
+
+// Load configuration from KeySmasherClient.ini in the executable directory
+// If the INI does not exist, create it with default host 0.0.0.0 and default port 80.
+// Returns true if a new INI file was created.
+bool LoadConfig() {
+    bool created = false;
+    wchar_t exePath[MAX_PATH] = {};
+    if (GetModuleFileNameW(NULL, exePath, MAX_PATH) == 0) return false;
+    std::wstring p(exePath);
+    size_t pos = p.find_last_of(L"\\/");
+    std::wstring dir = (pos == std::wstring::npos) ? L"." : p.substr(0, pos);
+    std::wstring iniPath = dir + L"\\KeySmasherClient.ini";
+
+    // If file doesn't exist, create with defaults
+    DWORD attrs = GetFileAttributesW(iniPath.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        // create default values
+        WritePrivateProfileStringW(L"Network", L"WebSocketHost", L"0.0.0.0", iniPath.c_str());
+        wchar_t portStr[16];
+        _itow_s((int)WS_PORT, portStr, 10);
+        WritePrivateProfileStringW(L"Network", L"WebSocketPort", portStr, iniPath.c_str());
+        created = true;
+    }
+
+    // read host
+    wchar_t hostBuf[256] = {};
+    GetPrivateProfileStringW(L"Network", L"WebSocketHost", WS_HOST.c_str(), hostBuf, _countof(hostBuf), iniPath.c_str());
+    if (hostBuf[0] != L'\0') WS_HOST = std::wstring(hostBuf);
+
+    // read port
+    int port = GetPrivateProfileIntW(L"Network", L"WebSocketPort", (int)WS_PORT, iniPath.c_str());
+    if (port > 0 && port <= 65535) WS_PORT = (INTERNET_PORT)port;
+
+    return created;
+}
 
 struct WSConnection {
     HINTERNET hSession = NULL;
@@ -518,6 +555,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         CloseHandle(g_singletonMutex);
         g_singletonMutex = NULL;
         return 1;
+    }
+
+    bool iniCreated = LoadConfig();
+    if (iniCreated) {
+        MessageBoxW(NULL, L"A configuration file 'KeySmasherClient.ini' was created next to the executable. Please set 'WebSocketHost' and 'WebSocketPort' in the [Network] section and restart the application.", L"KeySmasherClient - Configuration", MB_OK | MB_ICONINFORMATION);
+        if (g_singletonMutex) { CloseHandle(g_singletonMutex); g_singletonMutex = NULL; }
+        return 0;
     }
 
     // create hidden window to receive tray messages
