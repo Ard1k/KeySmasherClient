@@ -6,6 +6,13 @@
 #include <winhttp.h>
 #include <string>
 #include <iostream>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
+#include <memory>
+#include <chrono>
 
 #ifndef WINHTTP_WEB_SOCKET_SUCCESS_CLOSE
 #define WINHTTP_WEB_SOCKET_SUCCESS_CLOSE 1000
@@ -21,6 +28,19 @@ const std::wstring WS_HOST = L"192.168.40.70";
 const INTERNET_PORT WS_PORT = 80;
 const std::wstring WS_PATH = L"/ws";
 
+struct WSConnection {
+    HINTERNET hSession = NULL;
+    HINTERNET hConnect = NULL;
+    HINTERNET hWebSocket = NULL;
+};
+
+// Threading / queue for messages
+std::mutex queueMutex;
+std::condition_variable queueCv;
+std::queue<std::string> msgQueue;
+std::atomic<bool> running{ true };
+std::thread wsThread;
+
 bool IsTargetWindowActive() {
     HWND hwnd = GetForegroundWindow();
     if (!hwnd) return false;
@@ -31,30 +51,51 @@ bool IsTargetWindowActive() {
     return std::wstring(title).find(TARGET_TITLE) != std::wstring::npos;
 }
 
-void SendWebSocketMessage(const std::string& msg) {
-    HINTERNET hSession = WinHttpOpen(L"KeySmasherClient/1.0",
+void CloseWSConnection(std::unique_ptr<WSConnection>& conn) {
+    if (!conn) return;
+    if (conn->hWebSocket) {
+        WinHttpWebSocketClose(conn->hWebSocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE, NULL, 0);
+        WinHttpCloseHandle(conn->hWebSocket);
+        conn->hWebSocket = NULL;
+    }
+    if (conn->hConnect) {
+        WinHttpCloseHandle(conn->hConnect);
+        conn->hConnect = NULL;
+    }
+    if (conn->hSession) {
+        WinHttpCloseHandle(conn->hSession);
+        conn->hSession = NULL;
+    }
+    conn.reset();
+}
+
+std::unique_ptr<WSConnection> ConnectWebSocket() {
+    auto conn = std::make_unique<WSConnection>();
+
+    conn->hSession = WinHttpOpen(L"KeySmasherClient/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS, 0);
 
-    if (!hSession) return;
+    if (!conn->hSession) {
+        return nullptr;
+    }
 
-    HINTERNET hConnect = WinHttpConnect(hSession, WS_HOST.c_str(), WS_PORT, 0);
-    if (!hConnect) {
-        WinHttpCloseHandle(hSession);
-        return;
+    conn->hConnect = WinHttpConnect(conn->hSession, WS_HOST.c_str(), WS_PORT, 0);
+    if (!conn->hConnect) {
+        CloseWSConnection(conn);
+        return nullptr;
     }
 
     HINTERNET hRequest = WinHttpOpenRequest(
-        hConnect, L"GET", WS_PATH.c_str(),
+        conn->hConnect, L"GET", WS_PATH.c_str(),
         NULL, WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES,
         0);
 
     if (!hRequest) {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return;
+        CloseWSConnection(conn);
+        return nullptr;
     }
 
     BOOL result = WinHttpSetOption(hRequest,
@@ -63,9 +104,8 @@ void SendWebSocketMessage(const std::string& msg) {
 
     if (!result) {
         WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return;
+        CloseWSConnection(conn);
+        return nullptr;
     }
 
     result = WinHttpSendRequest(hRequest,
@@ -75,41 +115,82 @@ void SendWebSocketMessage(const std::string& msg) {
 
     if (!result || !WinHttpReceiveResponse(hRequest, NULL)) {
         WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return;
+        CloseWSConnection(conn);
+        return nullptr;
     }
 
-    HINTERNET hWebSocket = WinHttpWebSocketCompleteUpgrade(hRequest, NULL);
-    if (!hWebSocket) {
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return;
-    }
-
+    conn->hWebSocket = WinHttpWebSocketCompleteUpgrade(hRequest, NULL);
     WinHttpCloseHandle(hRequest);
 
-    WinHttpWebSocketSend(hWebSocket,
-        WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
-        (BYTE*)msg.c_str(),
-        (DWORD)msg.size());
+    if (!conn->hWebSocket) {
+        CloseWSConnection(conn);
+        return nullptr;
+    }
 
-    WinHttpWebSocketClose(hWebSocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE, NULL, 0);
+    return conn;
+}
 
-    WinHttpCloseHandle(hWebSocket);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
+void WSWorker() {
+    std::unique_ptr<WSConnection> conn;
+
+    while (running) {
+        if (!conn) {
+            conn = ConnectWebSocket();
+            if (!conn) {
+                // failed to connect, wait and retry
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                continue;
+            }
+        }
+
+        std::string msg;
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            if (msgQueue.empty()) {
+                // wait until a message arrives or running becomes false
+                queueCv.wait_for(lock, std::chrono::seconds(1));
+            }
+            if (!msgQueue.empty()) {
+                msg = std::move(msgQueue.front());
+                msgQueue.pop();
+            }
+        }
+
+        if (!msg.empty()) {
+            DWORD sendResult = WinHttpWebSocketSend(conn->hWebSocket,
+                WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+                (BYTE*)msg.c_str(),
+                (DWORD)msg.size());
+
+            if (sendResult != ERROR_SUCCESS) {
+                // treat as connection loss and attempt reconnect
+                CloseWSConnection(conn);
+            }
+        }
+    }
+
+    // Clean up on exit
+    CloseWSConnection(conn);
 }
 
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode == HC_ACTION && wParam == WM_KEYDOWN) {
-        KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
+    if (nCode == HC_ACTION) {
+        if (wParam == WM_KEYDOWN || wParam == WM_KEYUP || wParam == WM_SYSKEYDOWN || wParam == WM_SYSKEYUP) {
+            KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
 
-        if (IsTargetWindowActive()) {
-            std::string msg = std::to_string(kb->vkCode);
-            SendWebSocketMessage(msg);
-            std::cout << msg + "\n";
+            bool keyDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+            bool keyUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+
+            if (IsTargetWindowActive()) {
+                char prefix = keyDown ? 'd' : 'u';
+                std::string msg = std::string(1, prefix) + std::to_string(kb->vkCode);
+                {
+                    std::lock_guard<std::mutex> lock(queueMutex);
+                    msgQueue.push(msg);
+                }
+                queueCv.notify_one();
+                std::cout << msg + "\n";
+            }
         }
     }
 
@@ -117,10 +198,16 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 int main() {
+    // start websocket worker thread
+    wsThread = std::thread(WSWorker);
+
     keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, NULL, 0);
 
     if (!keyboardHook) {
         std::cout << "Failed to install hook\n";
+        running = false;
+        queueCv.notify_all();
+        if (wsThread.joinable()) wsThread.join();
         return 1;
     }
 
@@ -128,6 +215,11 @@ int main() {
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {}
+
+    // signal thread to stop and clean up
+    running = false;
+    queueCv.notify_all();
+    if (wsThread.joinable()) wsThread.join();
 
     UnhookWindowsHookEx(keyboardHook);
     return 0;
