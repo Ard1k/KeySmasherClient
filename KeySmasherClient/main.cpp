@@ -13,6 +13,7 @@
 #include <atomic>
 #include <memory>
 #include <chrono>
+#include <unordered_map>
 
 #ifndef WINHTTP_WEB_SOCKET_SUCCESS_CLOSE
 #define WINHTTP_WEB_SOCKET_SUCCESS_CLOSE 1000
@@ -41,6 +42,11 @@ std::queue<std::string> msgQueue;
 std::atomic<bool> running{ true };
 std::thread wsThread;
 
+// Title animator
+std::thread titleThread;
+std::mutex titleMutex;
+std::unordered_map<HWND, std::wstring> originalTitles;
+
 bool IsTargetWindowActive() {
     HWND hwnd = GetForegroundWindow();
     if (!hwnd) return false;
@@ -48,7 +54,10 @@ bool IsTargetWindowActive() {
     wchar_t title[256];
     GetWindowTextW(hwnd, title, 256);
 
-    return std::wstring(title).find(TARGET_TITLE) != std::wstring::npos;
+    std::wstring s(title);
+    // check starts with TARGET_TITLE
+    if (s.size() < TARGET_TITLE.size()) return false;
+    return s.compare(0, TARGET_TITLE.size(), TARGET_TITLE) == 0;
 }
 
 void CloseWSConnection(std::unique_ptr<WSConnection>& conn) {
@@ -173,6 +182,65 @@ void WSWorker() {
     CloseWSConnection(conn);
 }
 
+void TitleAnimator() {
+    const wchar_t* indicators[] = {L"-", L"\\", L"|", L"/"};
+    size_t idx = 0;
+
+    while (running) {
+        HWND hwnd = GetForegroundWindow();
+        bool active = false;
+        if (hwnd) {
+            wchar_t title[256];
+            GetWindowTextW(hwnd, title, 256);
+            std::wstring s(title);
+            if (s.size() >= TARGET_TITLE.size() && s.compare(0, TARGET_TITLE.size(), TARGET_TITLE) == 0) {
+                active = true;
+            }
+        }
+
+        if (active) {
+            // animate
+            std::wstring newTitle = TARGET_TITLE + L" [" + indicators[idx % 4] + L"]";
+            idx++;
+
+            // store original title once and set new title
+            {
+                std::lock_guard<std::mutex> lock(titleMutex);
+                if (originalTitles.find(hwnd) == originalTitles.end()) {
+                    wchar_t orig[256];
+                    GetWindowTextW(hwnd, orig, 256);
+                    originalTitles[hwnd] = std::wstring(orig);
+                }
+            }
+
+            SetWindowTextW(hwnd, newTitle.c_str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        } else {
+            // restore any titles we changed for windows that are no longer active
+            {
+                std::lock_guard<std::mutex> lock(titleMutex);
+                for (auto it = originalTitles.begin(); it != originalTitles.end();) {
+                    HWND h = it->first;
+                    if (h && IsWindow(h)) {
+                        SetWindowTextW(h, it->second.c_str());
+                    }
+                    it = originalTitles.erase(it);
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
+
+    // restore on exit
+    {
+        std::lock_guard<std::mutex> lock(titleMutex);
+        for (auto &p : originalTitles) {
+            if (p.first && IsWindow(p.first)) SetWindowTextW(p.first, p.second.c_str());
+        }
+        originalTitles.clear();
+    }
+}
+
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         if (wParam == WM_KEYDOWN || wParam == WM_KEYUP || wParam == WM_SYSKEYDOWN || wParam == WM_SYSKEYUP) {
@@ -211,6 +279,9 @@ int main() {
         return 1;
     }
 
+    // start title animator
+    titleThread = std::thread(TitleAnimator);
+
     std::cout << "Listening for keys...\n";
 
     MSG msg;
@@ -220,6 +291,7 @@ int main() {
     running = false;
     queueCv.notify_all();
     if (wsThread.joinable()) wsThread.join();
+    if (titleThread.joinable()) titleThread.join();
 
     UnhookWindowsHookEx(keyboardHook);
     return 0;
