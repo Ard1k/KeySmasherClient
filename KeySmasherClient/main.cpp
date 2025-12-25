@@ -6,7 +6,6 @@
 #include <shellapi.h>
 #include <winhttp.h>
 #include <string>
-#include <iostream>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -21,6 +20,7 @@
 #endif
 
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
 HHOOK keyboardHook;
 HWND lastForeground = nullptr;
@@ -53,11 +53,9 @@ std::unordered_map<HWND, std::wstring> originalTitles;
 // Tray
 const UINT TRAY_ICON_ID = 1;
 const UINT WM_TRAY_CALLBACK = WM_APP + 1;
-const int IDM_SHOW_CONSOLE = 1001;
+// const int IDM_SHOW_CONSOLE = 1001; // removed - no console
 const int IDM_TOGGLE_PAUSE = 1002;
 const int IDM_EXIT = 1003;
-
-bool consoleVisible = false;
 
 bool IsTargetWindowActive() {
     HWND hwnd = GetForegroundWindow();
@@ -283,8 +281,6 @@ void ShowTrayMenu(HWND hwnd) {
     GetCursorPos(&pt);
 
     HMENU hMenu = CreatePopupMenu();
-    std::wstring showLabel = consoleVisible ? L"Hide Console" : L"Show Console";
-    AppendMenu(hMenu, MF_STRING, IDM_SHOW_CONSOLE, showLabel.c_str());
     std::wstring pauseLabel = paused.load() ? L"Unpause" : L"Pause";
     AppendMenu(hMenu, MF_STRING, IDM_TOGGLE_PAUSE, pauseLabel.c_str());
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
@@ -306,27 +302,12 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (lParam == WM_RBUTTONUP) {
             ShowTrayMenu(hwnd);
         } else if (lParam == WM_LBUTTONDBLCLK) {
-            // toggle console on double-click
-            if (consoleVisible) {
-                ShowWindow(GetConsoleWindow(), SW_HIDE);
-                consoleVisible = false;
-            } else {
-                ShowWindow(GetConsoleWindow(), SW_SHOW);
-                consoleVisible = true;
-            }
+            // toggle pause on double-click
+            paused = !paused.load();
         }
         break;
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
-        case IDM_SHOW_CONSOLE:
-            if (consoleVisible) {
-                ShowWindow(GetConsoleWindow(), SW_HIDE);
-                consoleVisible = false;
-            } else {
-                ShowWindow(GetConsoleWindow(), SW_SHOW);
-                consoleVisible = true;
-            }
-            break;
         case IDM_TOGGLE_PAUSE:
             paused = !paused.load();
             break;
@@ -365,7 +346,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     msgQueue.push(msg);
                 }
                 queueCv.notify_one();
-                if (consoleVisible) std::cout << msg + "\n";
+                //std::cout << msg + "\n"; no console available to print
             }
         }
     }
@@ -373,9 +354,9 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
-int main() {
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     // create hidden window to receive tray messages
-    HINSTANCE hInstance = GetModuleHandle(NULL);
+    // HINSTANCE hInstance = GetModuleHandle(NULL); // use provided hInstance
     WNDCLASSEX wc = {};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = TrayWndProc;
@@ -387,18 +368,11 @@ int main() {
         0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
 
     if (!g_hWnd) {
-        std::cout << "Failed to create tray window\n";
+        MessageBoxW(NULL, L"Failed to create tray window", L"KeySmasherClient", MB_OK | MB_ICONERROR);
         return 1;
     }
 
     AddTrayIcon(g_hWnd);
-
-    // hide console by default
-    HWND console = GetConsoleWindow();
-    if (console) {
-        ShowWindow(console, SW_HIDE);
-        consoleVisible = false;
-    }
 
     // start websocket worker thread
     wsThread = std::thread(WSWorker);
@@ -406,7 +380,7 @@ int main() {
     keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, NULL, 0);
 
     if (!keyboardHook) {
-        std::cout << "Failed to install hook\n";
+        MessageBoxW(NULL, L"Failed to install hook", L"KeySmasherClient", MB_OK | MB_ICONERROR);
         running = false;
         queueCv.notify_all();
         if (wsThread.joinable()) wsThread.join();
